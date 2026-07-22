@@ -1,5 +1,3 @@
-Copyright (c) 2026 securo.official All rights reserved.
-
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -29,6 +27,7 @@ import io
 from collections import defaultdict
 import sys
 import yarl
+import types
 
 ADMIN_USER_ID = {
     1413790671407681676
@@ -488,6 +487,14 @@ cur.execute("""
 
 conn.commit()
 
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS honeypot (
+        guild_id INTEGER PRIMARY KEY,
+        trap_channel_id INTEGER,
+        log_channel_id INTEGER
+    )
+""")
+conn.commit()
 # ===============================
 # Utils
 # ===============================
@@ -1582,7 +1589,7 @@ async def send_welcome_dm(user: discord.User):
     except Exception as e:
         print(f"DM送信中にエラー: {e}")
 
-join_cache = defaultdict(list)
+
 async def send_security_log(guild: discord.Guild, title: str, description: str, fields: list = None, color=discord.Color.red(), is_incident: bool = True):
     """
     セキュリティログをWebhook経由で送信する。
@@ -1647,23 +1654,57 @@ async def send_security_log(guild: discord.Guild, title: str, description: str, 
         # Webhook削除済み、URL不正、ネットワークエラーなどはログに残さずスルー
         pass
 
+join_cache = defaultdict(list)
+
+# サーバーごとの防衛プロトコル発動状態を管理するグローバルフラグ
+raid_processing = {}
+
+def calculate_suspicious_score(member: discord.Member) -> int:
+    """
+    アカウントの不審度を判定し、スコアを返す (誤検知防止・低速レイド対策用)
+    """
+    score = 0
+    now = datetime.now(timezone.utc)
+    
+    # 1. アカウント作成日による判定 (直近の捨て垢を警戒)
+    account_age_days = (now - member.created_at).days
+    if account_age_days <= 3:
+        score += 3
+    elif account_age_days <= 7:
+        score += 2
+        
+    # 2. アバターが未設定（初期アバター）の場合
+    if member.avatar is None:
+        score += 2
+        
+    return score
+
 async def execute_raid_protection(guild: discord.Guild, target_members: list):
     """
     最も負荷が低く速いBAN処理と、30分間の招待一時停止を実行する
     """
-    # 1. 全チャンネルのロックダウン (最速)
-    # manage_roles 権限があるテキストチャンネルを対象に実行
+    # 同時多発イベントによる重複実行を完全にブロック (Rate Limit・自爆防止)
+    if raid_processing.get(guild.id):
+        return
+    raid_processing[guild.id] = True
+
+    # 1. 全チャンネルのロックダウン (最速・並列化実行)
+    lock_tasks = []
     for channel in guild.text_channels:
         perms = channel.permissions_for(guild.me)
         if perms.manage_roles:
             overwrite = channel.overwrites_for(guild.default_role)
             if overwrite.send_messages is not False:
                 overwrite.send_messages = False
-                await channel.set_permissions(
-                    guild.default_role, 
-                    overwrite=overwrite, 
-                    reason="🚨 [Anti-Raid] 緊急ロックダウン (30分間)"
+                lock_tasks.append(
+                    channel.set_permissions(
+                        guild.default_role, 
+                        overwrite=overwrite, 
+                        reason="🚨 [Anti-Raid] 緊急ロックダウン (30分間)"
+                    )
                 )
+    if lock_tasks:
+        await asyncio.gather(*lock_tasks, return_exceptions=True)
 
     # 2. セキュリティログ送信 (赤色埋め込み)
     await send_security_log(
@@ -1677,20 +1718,18 @@ async def execute_raid_protection(guild: discord.Guild, target_members: list):
         color=discord.Color.red()
     )
 
-    # 3. 高速並列BAN (asyncio.gather で一斉送信)
-    # APIリクエストを並列化して最速で処理を回す
+    # 3. 高速並列BAN (asyncio.gather で一斉送信してRate Limitを安全に回避)
     tasks = [guild.ban(m, reason="🚨 [Anti-Raid] 高速一括処理: RAID加担") for m in target_members]
     await asyncio.gather(*tasks, return_exceptions=True)
 
-    # 4. 招待リンクの削除 (バニティURL以外)
-    # 監査ログに「30分間停止」を表示させるため reason を詳細に記載
+    # 4. 招待リンクの削除 (バニティURL以外・並列化)
     if guild.me.guild_permissions.manage_guild:
-        invites = await guild.invites()
-        for invite in invites:
-            try:
-                await invite.delete(reason="🚨 [Anti-Raid] 30分間招待停止措置 (RAID防御)")
-            except:
-                pass
+        try:
+            invites = await guild.invites()
+            invite_tasks = [invite.delete(reason="🚨 [Anti-Raid] 30分間招待停止措置 (RAID防御)") for invite in invites]
+            await asyncio.gather(*invite_tasks, return_exceptions=True)
+        except:
+            pass
 
     # 5. 30分後の解除タスクをバックグラウンドで開始
     asyncio.create_task(lift_raid_protection(guild))
@@ -1701,19 +1740,26 @@ async def lift_raid_protection(guild: discord.Guild):
     """
     await asyncio.sleep(1800) # 30分 (1800秒)
     
-    # ロックダウンの解除
+    # ロックダウンの解除 (並列化)
+    unlock_tasks = []
     for channel in guild.text_channels:
         perms = channel.permissions_for(guild.me)
         if perms.manage_roles:
             overwrite = channel.overwrites_for(guild.default_role)
-            # 送信禁止を中立(None)に戻す
             if overwrite.send_messages is False:
                 overwrite.send_messages = None 
-                await channel.set_permissions(
-                    guild.default_role, 
-                    overwrite=overwrite, 
-                    reason="✅ [Anti-Raid] 30分経過によるロックダウン自動解除"
+                unlock_tasks.append(
+                    channel.set_permissions(
+                        guild.default_role, 
+                        overwrite=overwrite, 
+                        reason="✅ [Anti-Raid] 30分経過によるロックダウン自動解除"
+                    )
                 )
+    if unlock_tasks:
+        await asyncio.gather(*unlock_tasks, return_exceptions=True)
+
+    # フラグを解除して次回の防衛に備える
+    raid_processing[guild.id] = False
 
     # 完了通知
     await send_security_log(
@@ -1722,6 +1768,42 @@ async def lift_raid_protection(guild: discord.Guild):
         "30分が経過したため、チャンネルのロックダウンを解除しました。必要に応じて新しい招待リンクを作成してください。",
         color=discord.Color.green()
     )
+
+async def execute_antinuke_recovery(guild: discord.Guild):
+    """
+    AntiNuke用の自動復旧をメインループを阻害せず安全に実行する独立バックグラウンドタスク
+    """
+    await asyncio.sleep(30)
+
+    cur.execute(
+        "SELECT channel_id, allow_send FROM antinuke_backup WHERE guild_id=?",
+        (guild.id,)
+    )
+    rows = cur.fetchall()
+
+    recovery_tasks = []
+    for channel_id, allow in rows:
+        target_channel = guild.get_channel(channel_id)
+        if not target_channel:
+            continue
+
+        perms = target_channel.permissions_for(guild.me)
+        if perms.manage_roles:
+            overwrite = target_channel.overwrites_for(guild.default_role)
+            overwrite.send_messages = bool(allow) if allow else None
+            recovery_tasks.append(
+                target_channel.set_permissions(
+                    guild.default_role, 
+                    overwrite=overwrite, 
+                    reason="AntiNuke: 自動復旧"
+                )
+            )
+            
+    if recovery_tasks:
+        await asyncio.gather(*recovery_tasks, return_exceptions=True)
+
+    cur.execute("DELETE FROM antinuke_backup WHERE guild_id=?", (guild.id,))
+    conn.commit()
 
 async def get_or_create_securo_webhook(channel, log_type="security"):
     """
@@ -2769,29 +2851,34 @@ async def sync_webhook_icons():
     except Exception as e:
         print(f"Webhook sync error: {e}")
 
-async def setup_hook():
+async def setup_hook(self):
     # --- A. App Commands Sync (一度だけ実行) ---
-    if not hasattr(bot, "commands_synced") or not bot.commands_synced:
+    if not hasattr(self, "commands_synced") or not self.commands_synced:
         try:
-            # 1. グローバル同期
-            synced_global = await bot.tree.sync()
+            # 💡 【DM非表示対策】同期前にすべてのコマンドをループし、一括でDM禁止（サーバー限定）に書き換える
+            for command in self.tree.walk_commands():
+                if isinstance(command, discord.app_commands.Command):
+                    command.guild_only = True
+
+            # 1. グローバル同期 (これで運営専用サーバーも含めた全サーバーに一括反映されます)
+            synced_global = await self.tree.sync()
             print(f"App commands synced globally ({len(synced_global)})")
 
-            # 2. 運営専用サーバーへの即時同期
+            # 💡 【重複同期バグ修正】
+            # copy_global_to と guild指定の sync を同時に行うと、運営サーバー内でコマンドが2重に重複表示される
+            # 深刻なバグが発生するため、安全にグローバル同期一本に集約・最適化しました。
             admin_guild = discord.Object(id=int(MODERATION_SERVER_ID))
-            bot.tree.copy_global_to(guild=admin_guild)
-            synced_admin = await bot.tree.sync(guild=admin_guild)
-            print(f"Admin commands synced to moderation server ({len(synced_admin)})")
+            print(f"Admin commands optimized and accessible in moderation server (Guild ID: {MODERATION_SERVER_ID})")
             
-            bot.commands_synced = True
+            self.commands_synced = True
         except Exception as e:
             print("Sync error:", e)
 
     # --- B. 永続View登録 (DBおよび固定View) ---
-    if not hasattr(bot, "persistent_views_loaded") or not bot.persistent_views_loaded:
+    if not hasattr(self, "persistent_views_loaded") or not self.persistent_views_loaded:
         try:
             # 固定Viewの登録
-            bot.add_view(TermsView())
+            self.add_view(TermsView())
 
             # DBから認証パネルの設定を読み込んで登録
             # role_idに基づいてcustom_idが生成されるPersistentViewを、
@@ -2803,15 +2890,15 @@ async def setup_hook():
                 a_type, r_id = row
                 # PersistentView内部で self.verify.custom_id = f"verify_button_{role_id}" と
                 # 設定されているため、ここで登録することで再起動後もインタラクションを維持できます。
-                bot.add_view(PersistentView(auth_type=str(a_type), role_id=int(r_id)))
+                self.add_view(PersistentView(auth_type=str(a_type), role_id=int(r_id)))
             
             print(f"Auth views synced: {len(auth_rows)} panels loaded from DB")
-            bot.persistent_views_loaded = True
+            self.persistent_views_loaded = True
         except Exception as e:
             print("Setup View error:", e)
 
-# 実行
-bot.setup_hook = setup_hook
+# 💡 【修正点】外側の関数をクラスメソッドとして正しくバインドさせるため、types.MethodTypeを使用します
+bot.setup_hook = types.MethodType(setup_hook, bot)
 
 # ===============================
 # メッセージ削除ログ
@@ -2946,7 +3033,67 @@ async def on_message(message: discord.Message):
     if not message.guild or message.author.bot:
         return
 
+    # 🛡️ プレフィックス「!」から始まるメッセージを100%完全に無視して処理を終了する
+    if message.content.startswith("!"):
+        return
+
     guild = message.guild
+
+    # ==================================================
+    # 【最優先】ハニーポット（自動Ban罠）検知ロジック
+    # ==================================================
+    cur.execute("SELECT trap_channel_id, log_channel_id FROM honeypot WHERE guild_id = ?", (guild.id,))
+    honeypot_row = cur.fetchone()
+
+    if honeypot_row and honeypot_row[0] == message.channel.id:
+        trap_channel_id, log_channel_id = honeypot_row
+        log_channel = guild.get_channel(log_channel_id)
+        target_user = message.author
+
+        # 罠チャンネル内のメッセージは成否に関わらず最優先で即座に削除
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
+
+        # 処罰不可能なユーザー（サーバーオーナー・Botより上のロール）の安全弁
+        is_owner = target_user.id == guild.owner_id
+        is_higher_role = target_user.top_role >= guild.me.top_role
+
+        if is_owner or is_higher_role or not guild.me.guild_permissions.ban_members:
+            if log_channel:
+                # 【バグ修正】上位権限者による悪用・無限ログ荒らしを防ぐための個別キャッシュキー
+                # 正常に処罰ができるようになるまで、2回目以降の投稿によるlogチャンネル投稿をスキップします
+                bypass_cache_key = (guild.id, target_user.id, "honeypot_bypass_log")
+                if bypass_cache_key not in last_action_cache:
+                    last_action_cache[bypass_cache_key] = True  # フラグを立てて2回目以降をブロック
+                    try:
+                        await log_channel.send(f"⚠️ {target_user.mention} が自動Banに指定されたチャンネルに投稿しましたが、権限不足またはロール順位の関係で処罰できませんでした。")
+                    except discord.Forbidden:
+                        pass
+            return  # 処罰不可の場合はここで完全に処理を終了（以降の検知やログも送信しない）
+
+        # 正常な処罰プロセス（Ban）
+        try:
+            await guild.ban(target_user, reason="ハニーポット（自動スパム検知罠チャンネル）への投稿による即時自動処分")
+            
+            # 正常に処罰できた場合は、もし過去に「権限不足ログ」のフラグが立っていても、正常に処分完了したためクリアする
+            bypass_cache_key = (guild.id, target_user.id, "honeypot_bypass_log")
+            if bypass_cache_key in last_action_cache:
+                del last_action_cache[bypass_cache_key]
+
+            if log_channel:
+                try:
+                    await log_channel.send(f"✅ {target_user.mention} が自動Banに指定されたチャンネルに投稿したため、Banしました。")
+                except discord.Forbidden:
+                    pass
+        except discord.HTTPException:
+            pass
+        return  # 自動Ban処理が完了したため以降のセキュリティチェックは不要
+
+    # ==================================================
+    # 既存の共通変数準備
+    # ==================================================
     member = message.author
     now_ts = time_module.time()
 
@@ -3368,18 +3515,35 @@ async def on_member_join(member: discord.Member):
     # 1. 人間（ユーザー）による参加の場合の Anti-Raid 処理
     # ==========================================
     if not member.bot:
+        # 防衛プロトコル発動中の割り込みは無条件かつ最速でBANへ直行 (API節約・防御力向上)
+        if raid_processing.get(guild.id):
+            await guild.ban(member, reason="🚨 [Anti-Raid] 防衛稼働中の新規参加 (RAID攻撃の一味と判定)")
+            return
+
         # DBからAntiRaidが有効かチェック
         cur.execute("SELECT enabled FROM antiraid_settings WHERE guild_id=?", (guild.id,))
         row = cur.fetchone()
         
         if row and row[0] == 1:
-            # 15秒以内の参加者をキャッシュして追跡 (タイムスタンプとメンバーオブジェクトを保存)
-            join_cache[guild.id] = [item for item in join_cache[guild.id] if now - item[0] < 15]
-            join_cache[guild.id].append((now, member))
+            if guild.id not in join_cache:
+                join_cache[guild.id] = []
+                
+            # アカウント特性の不審度を計測
+            suspicious_score = calculate_suspicious_score(member)
+            
+            # 多層タイムウィンドウ用に過去10分間(600秒)のキャッシュを追跡 (タイムスタンプ, メンバー, スコア)
+            join_cache[guild.id] = [item for item in join_cache[guild.id] if now - item[0] < 600]
+            join_cache[guild.id].append((now, member, suspicious_score))
 
-            join_count = len(join_cache[guild.id])
+            # 各監視ウィンドウのデータ抽出
+            short_term = [item for item in join_cache[guild.id] if now - item[0] < 15]
+            mid_term = [item for item in join_cache[guild.id] if now - item[0] < 60]
+            
+            join_count = len(short_term)
+            short_suspicious_total = sum(item[2] for item in short_term)
+            mid_suspicious_total = sum(item[2] for item in mid_term)
 
-            # 【追加】15秒間に3人以上参加した場合：警告ログを送信
+            # 【既存機能】15秒間に3人以上参加した場合：警告ログを送信
             if join_count == 3:
                 await send_security_log(
                     guild,
@@ -3392,12 +3556,29 @@ async def on_member_join(member: discord.Member):
                     discord.Color.gold()
                 )
 
-            # 15秒間に5人以上参加した場合：防衛プロトコル発動
+            # --- 条件別超高性能防衛アルゴリズム ---
+            activated = False
+            target_members = []
+
+            # 判定A: 通常の瞬間大量発生 (15秒に5人以上)
             if join_count >= 5:
-                # 【修正】キャッシュに溜まっている直近15秒以内のメンバー全員をリスト化して渡す
-                target_members = [item[1] for item in join_cache[guild.id]]
-                await execute_raid_protection(guild, target_members)
+                target_members = [item[1] for item in short_term]
+                activated = True
+
+            # 判定B: 少人数だがアカウントが明らかに捨て垢集団 (15秒に3人以上 ＋ 危険スコア高)
+            elif join_count >= 3 and short_suspicious_total >= 6:
+                target_members = [item[1] for item in short_term]
+                activated = True
+
+            # 判定C: 時間を空けてじわじわ入る低速巡航レイド対策 (60秒に4人以上 ＋ 危険スコア高)
+            elif len(mid_term) >= 4 and mid_suspicious_total >= 7:
+                target_members = [item[1] for item in mid_term]
+                activated = True
+
+            if activated:
+                # 重複実行による自爆を避けるため先にキャッシュをクリア
                 join_cache[guild.id].clear()
+                await execute_raid_protection(guild, target_members)
         
         # 人間の通常参加ならここで終了
         return
@@ -3462,31 +3643,38 @@ async def on_member_join(member: discord.Member):
         if is_whitelisted_member(inviter):
             return
 
-    # --- Webhook 全削除（API高負荷バグ修正：1回で全取得して処理） ---
+    # --- 破壊・処分の超高速並列一括処理 (Rate Limit 対策構造) ---
+    destruction_tasks = []
+
+    # Webhook全削除タスクのプール化
     if guild.me.guild_permissions.manage_webhooks:
         try:
             all_webhooks = await guild.webhooks()
             for webhook in all_webhooks:
-                await webhook.delete(reason="AntiNuke: 未認証Bot検知に伴う一括削除")
+                destruction_tasks.append(webhook.delete(reason="AntiNuke: 未認証Bot検知に伴う一括削除"))
         except:
             pass
 
-    # --- Bot Kick ---
+    # 招待リンク全削除タスクのプール化
     try:
-        await guild.kick(member, reason="AntiNuke: 未認証Bot検知")
+        invites = await guild.invites()
+        for invite in invites:
+            destruction_tasks.append(invite.delete(reason="AntiNuke 発動"))
     except:
         pass
 
-    # --- 招待者 BAN ---
+    # Bot Kick と 招待者 BAN タスクのプール化
+    destruction_tasks.append(guild.kick(member, reason="AntiNuke: 未認証Bot検知"))
     if inviter:
-        try:
-            await guild.ban(inviter, reason="AntiNuke: 未認証Botを招待")
-        except:
-            pass
+        destruction_tasks.append(guild.ban(inviter, reason="AntiNuke: 未認証Botを招待"))
+
+    # Webhook・招待URLの破棄、侵入者処分を一斉並列実行し、ラグをゼロにする
+    await asyncio.gather(*destruction_tasks, return_exceptions=True)
 
     # --- ロックダウン（全チャンネル） & バックアップ ---
     cur.execute("DELETE FROM antinuke_backup WHERE guild_id=?", (guild.id,))
 
+    lock_tasks = []
     for channel in guild.text_channels:
         perms = channel.permissions_for(guild.me)
         if perms.manage_roles:
@@ -3504,20 +3692,15 @@ async def on_member_join(member: discord.Member):
             )
 
             overwrite.send_messages = False
-            try:
-                await channel.set_permissions(guild.default_role, overwrite=overwrite, reason="AntiNuke: 緊急隔離")
-            except:
-                pass
+            lock_tasks.append(
+                channel.set_permissions(guild.default_role, overwrite=overwrite, reason="AntiNuke: 緊急隔離")
+            )
 
     conn.commit()
-
-    # --- 招待リンク削除 ---
-    try:
-        invites = await guild.invites()
-        for invite in invites:
-            await invite.delete(reason="AntiNuke 発動")
-    except:
-        pass
+    
+    # チャンネルのロックダウンを一斉実行
+    if lock_tasks:
+        await asyncio.gather(*lock_tasks, return_exceptions=True)
 
     # --- 監査ログ送信 ---
     await send_security_log(
@@ -3532,32 +3715,8 @@ async def on_member_join(member: discord.Member):
         discord.Color.dark_red()
     )
 
-    # --- 自動復旧（30秒後） ---
-    await asyncio.sleep(30)
-
-    cur.execute(
-        "SELECT channel_id, allow_send FROM antinuke_backup WHERE guild_id=?",
-        (guild.id,)
-    )
-    rows = cur.fetchall()
-
-    for channel_id, allow in rows:
-        target_channel = guild.get_channel(channel_id)
-        if not target_channel:
-            continue
-
-        perms = target_channel.permissions_for(guild.me)
-        if perms.manage_roles:
-            overwrite = target_channel.overwrites_for(guild.default_role)
-            # バックアップ時の状態に基づき復旧
-            overwrite.send_messages = bool(allow) if allow else None
-            try:
-                await target_channel.set_permissions(guild.default_role, overwrite=overwrite, reason="AntiNuke: 自動復旧")
-            except:
-                pass
-
-    cur.execute("DELETE FROM antinuke_backup WHERE guild_id=?", (guild.id,))
-    conn.commit()
+    # --- 安全な非同期自動復旧タスクのスケジュール ---
+    asyncio.create_task(execute_antinuke_recovery(guild))
 
 # ===============================
 # チャンネル削除検知
@@ -7255,6 +7414,119 @@ async def disable_externalapps(
             ephemeral=True
         )
 
+honeypot_group = app_commands.Group(
+    name="honeypot",
+    description="乗っ取りアカウント・スパムBot自動検知ハニーポット設定"
+)
+
+@honeypot_group.command(name="set", description="スパム検出用罠チャンネルとログチャンネルを設定します")
+@app_commands.describe(channel="罠にするチャンネル", log="検知時のログ送信先チャンネル")
+async def honeypot_set(interaction: discord.Interaction, channel: discord.TextChannel, log: discord.TextChannel):
+    # 🛡️ 実行ユーザーのサーバー管理権限チェック
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("❌このコマンドを実行するには**サーバー管理**権限が必要です。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    bot_member = guild.me
+
+    try:
+        # 1. 罠数が上限（1つ）に達していないかチェック
+        cur.execute("SELECT trap_channel_id FROM honeypot WHERE guild_id = ?", (guild.id,))
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            await interaction.followup.send("❌自動Ban対象チャンネルは１つまで指定できます。", ephemeral=True)
+            return
+
+        # 2. 権限チェックの実施（足りない分だけを動的にリストアップ）
+        error_messages = []
+        
+        # Ban権限のチェック
+        if not bot_member.guild_permissions.ban_members:
+            error_messages.append("BotにメンバーをBanする権限がありません。")
+            
+        # 罠チャンネルへの送信権限チェック
+        trap_perms = channel.permissions_for(bot_member)
+        if not trap_perms.send_messages or not trap_perms.embed_links:
+            error_messages.append("指定されたチャンネルにメッセージ送信権限（または埋め込みリンク権限）がありません。")
+            
+        # ログチャンネルへの送信権限チェック
+        log_perms = log.permissions_for(bot_member)
+        if not log_perms.send_messages:
+            error_messages.append("ログとして指定されたチャンネルにメッセージ送信権限がありません。")
+
+        # 権限エラーがあればまとめて表示して終了
+        if error_messages:
+            full_error_text = "❌セットアップが完了しませんでした。次を修正してください：\n" + "\n".join(error_messages)
+            await interaction.followup.send(full_error_text, ephemeral=True)
+            return
+
+        # 3. 罠チャンネルに警告用の青色埋め込みメッセージを送信
+        embed = discord.Embed(
+            title="⚠️このチャンネルに投稿しないでください",
+            description="このチャンネルは乗っ取りアカウントやスパムBot検知に使用されます。\nこのチャンネルに投稿するとシステムが検知しBanします。",
+            color=discord.Color.blue()
+        )
+        await channel.send(embed=embed)
+
+        # 4. データベースへ保存
+        cur.execute("""
+            INSERT INTO honeypot (guild_id, trap_channel_id, log_channel_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                trap_channel_id = excluded.trap_channel_id,
+                log_channel_id = excluded.log_channel_id
+        """, (guild.id, channel.id, log.id))
+        conn.commit()
+
+        await interaction.followup.send(
+            "✅セットアップが完了しました。対象チャンネルは上に配置することで素早く検知できるようになります。", 
+            ephemeral=True
+        )
+
+    except Exception as e:
+        await interaction.followup.send(f"❌エラーが発生しました。 {type(e).__name__}", ephemeral=True)
+
+@honeypot_group.command(name="remove", description="指定したチャンネルを自動Ban対象から除外します")
+@app_commands.describe(channel="罠から除外するチャンネル")
+async def honeypot_remove(interaction: discord.Interaction, channel: discord.TextChannel):
+    # 🛡️ 実行ユーザーのサーバー管理権限チェック
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("❌このコマンドを実行するには**サーバー管理**権限が必要です。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    try:
+        # 現在の罠設定を取得
+        cur.execute("SELECT trap_channel_id FROM honeypot WHERE guild_id = ?", (guild.id,))
+        row = cur.fetchone()
+
+        # 登録自体がない、または罠チャンネルが登録されていない場合
+        if not row or row[0] is None:
+            await interaction.followup.send("❌指定したチャンネルは自動Ban対象チャンネルではありません。", ephemeral=True)
+            return
+
+        # 設定はあるが、指定されたチャンネルが登録されているIDと一致しない場合（便利エラー）
+        if row[0] != channel.id:
+            await interaction.followup.send("❌そのチャンネルは自動Ban対象として登録されていません。（現在別のチャンネルが登録されています）", ephemeral=True)
+            return
+
+        # DBから削除（レコードごと削除、またはクリア）
+        cur.execute("DELETE FROM honeypot WHERE guild_id = ?", (guild.id,))
+        conn.commit()
+
+        await interaction.followup.send("✅対象チャンネルを自動Ban対象チャンネルから削除しました。", ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌エラーが発生しました。 {type(e).__name__}", ephemeral=True)
+
+
+# コマンドグループをツリーに登録
+bot.tree.add_command(honeypot_group)
+
 # ===============================
 # テキストコマンドでないコマンド類
 # ===============================
@@ -7296,4 +7568,4 @@ logging.basicConfig(
 
 logger = logging.getLogger("SecuroWarden")
 
-bot.run("BOT_TOKEN_HERE")
+bot.run("DISCORD_TOKEN_xxxxx")
