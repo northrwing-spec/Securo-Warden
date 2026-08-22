@@ -46,6 +46,7 @@ SUPPORT_GUILD_ID = 1460072359305154700
 SUPPORT_LINK = "https://discord.gg/aBZSVxBpV5"
 DEFAULT_COLOR = 0x00bfff  # 指定の水色
 MODERATION_SERVER_ID = 1470994567485591564
+LOG_CHANNEL_ID = 1470994716362281193
 
 DANGEROUS_PERMS = {
     "administrator": "サーバーの全操作が可能になり、場合によってはサーバーを崩壊できてしまいます",
@@ -692,8 +693,9 @@ def looks_random(name: str, user_id: int = None, owner_id: int = None) -> bool:
             # 単に数字が連続しているだけ（例: 21235）なら、文字数全体に対して数字が多すぎない限り許容する。
             # ただし、末尾4桁数字かつ全体が「人名風で異様に長い」スパムは後述のロジックで仕留める。
             
-            # ① 母音（aeiou）が1文字も含まれない → 高確率でランダム生成
-            if not re.search(r"[aeiouAEIOU]", name):
+            # ① 母音（aeiouy）が1文字も含まれない（8文字以上の純英字のみ対象で誤検知防止）
+            # ※ y も母音扱いとし、短めの省略形（例: Crypt, Rhythm）の誤検知を防ぐ
+            if length >= 8 and name.isalpha() and not re.search(r"[aeiouyAEIOUY]", name):
                 return True
 
             # ② 同一文字の5連続以上（aaaaaa等）
@@ -712,11 +714,9 @@ def looks_random(name: str, user_id: int = None, owner_id: int = None) -> bool:
             if re.search(r"[bcdfghjklmnpqrstvxz]{6,}", name, re.I):
                 return True
 
-            # ⑤ 【ターゲット検知】乗っ取りスパムに多い「人名風ロング名 ＋ 末尾4桁数字」
-            # 例: rhondaramirez0290 (19文字)
-            # 全体が15文字以上と長く、末尾が「ちょうど4桁の数字」で終わる。かつ、数字の比率が多すぎないもの
-            if length >= 15 and re.search(r'(?<!\d)\d{4}$', name):
-                # 一般人の「gohan2004」などの短い名前は上の length>=15 で弾かれるため安全
+            # ⑤ 【ターゲット検知】乗っ取りスパムに多い「超長文＋ランダム要素＋末尾4桁」
+            # 例: Christopher1998 などの本名系誤検知を防ぐため、18文字以上かつ英数字の切り替わり(transitions)が4回以上のスパム特有パターンのみ検出
+            if length >= 18 and re.search(r'(?<!\d)\d{4}$', name) and transitions >= 4:
                 return True
 
             # ⑥ 完全に数字だけのアカウント（Botの自動生成に多い）
@@ -2855,21 +2855,33 @@ async def setup_hook(self):
     # --- A. App Commands Sync (一度だけ実行) ---
     if not hasattr(self, "commands_synced") or not self.commands_synced:
         try:
-            # 💡 【DM非表示対策】同期前にすべてのコマンドをループし、一括でDM禁止（サーバー限定）に書き換える
+            admin_guild = discord.Object(id=int(MODERATION_SERVER_ID))
+
+            # 1. 全コマンドをループしてDM非表示 (guild_only = True) を設定
             for command in self.tree.walk_commands():
                 if isinstance(command, discord.app_commands.Command):
                     command.guild_only = True
 
-            # 1. グローバル同期 (これで運営専用サーバーも含めた全サーバーに一括反映されます)
-            synced_global = await self.tree.sync()
-            print(f"App commands synced globally ({len(synced_global)})")
+            # 2. 【管理コマンドのギルド限定化処理】
+            # 名前が "admin_" で始まるコマンドをグローバルツリーから除外して管理サーバー限定ツリーへ移動
+            # ※ これにより「管理サーバーのみで即時反映」＆「他サーバーへの漏洩防止」＆「二重表示の防止」が完結します
+            admin_commands = []
+            for cmd in list(self.tree.get_commands()):
+                if cmd.name.startswith("admin_"):
+                    # グローバルツリーから取り外す
+                    self.tree.remove_command(cmd.name)
+                    # 管理サーバー専用コマンドとして追加
+                    self.tree.add_command(cmd, guild=admin_guild)
+                    admin_commands.append(cmd.name)
 
-            # 💡 【重複同期バグ修正】
-            # copy_global_to と guild指定の sync を同時に行うと、運営サーバー内でコマンドが2重に重複表示される
-            # 深刻なバグが発生するため、安全にグローバル同期一本に集約・最適化しました。
-            admin_guild = discord.Object(id=int(MODERATION_SERVER_ID))
-            print(f"Admin commands optimized and accessible in moderation server (Guild ID: {MODERATION_SERVER_ID})")
-            
+            # 3. 管理サーバーへの即時同期 (admin_ コマンドが即座に反映されます)
+            synced_guild = await self.tree.sync(guild=admin_guild)
+            print(f"Admin commands synced to Moderation Server ({len(synced_guild)} commands: {admin_commands})")
+
+            # 4. グローバル同期 (admin_ 以外の一般コマンドを全サーバーへ同期)
+            synced_global = await self.tree.sync()
+            print(f"App commands synced globally ({len(synced_global)} commands)")
+
             self.commands_synced = True
         except Exception as e:
             print("Sync error:", e)
@@ -2881,15 +2893,11 @@ async def setup_hook(self):
             self.add_view(TermsView())
 
             # DBから認証パネルの設定を読み込んで登録
-            # role_idに基づいてcustom_idが生成されるPersistentViewを、
-            # DBに保存されている全てのサーバー設定分、ループで登録します。
             cur.execute("SELECT auth_type, role_id FROM auth_settings")
             auth_rows = cur.fetchall()
             
             for row in auth_rows:
                 a_type, r_id = row
-                # PersistentView内部で self.verify.custom_id = f"verify_button_{role_id}" と
-                # 設定されているため、ここで登録することで再起動後もインタラクションを維持できます。
                 self.add_view(PersistentView(auth_type=str(a_type), role_id=int(r_id)))
             
             print(f"Auth views synced: {len(auth_rows)} panels loaded from DB")
@@ -2897,7 +2905,7 @@ async def setup_hook(self):
         except Exception as e:
             print("Setup View error:", e)
 
-# 💡 【修正点】外側の関数をクラスメソッドとして正しくバインドさせるため、types.MethodTypeを使用します
+# クラスメソッドとして動的バインド
 bot.setup_hook = types.MethodType(setup_hook, bot)
 
 # ===============================
@@ -4250,6 +4258,85 @@ async def daily_stats_report():
             )
         except Exception as e:
             print(f"[ERROR][daily_stats_report] Guild: {guild_id} - {e}")
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    """BotがサーバーからKick/Ban/脱退した際に実行される"""
+    # チャンネルの取得（キャッシュから取得、なければAPI取得）
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    if log_channel is None:
+        try:
+            log_channel = await bot.fetch_channel(LOG_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return  # チャンネルが存在しない・アクセス不可の場合は安全に終了
+
+    if not isinstance(log_channel, discord.TextChannel):
+        return  # テキストチャンネルでない場合は終了
+
+    target_guild_id_str = str(guild.id)
+    messages_to_delete = []
+
+    try:
+        # 最新のメッセージから順に走査（100件程度の削除を想定）
+        async for message in log_channel.history(limit=500):
+            if not message.embeds:
+                continue
+
+            # Embed内に脱退した Guild ID が含まれているか判定
+            is_target = False
+            for embed in message.embeds:
+                # フィールド値をチェック
+                for field in embed.fields:
+                    if target_guild_id_str in field.value:
+                        is_target = True
+                        break
+
+                # Description / Title 等をチェック
+                if not is_target and embed.description and target_guild_id_str in embed.description:
+                    is_target = True
+
+                if is_target:
+                    messages_to_delete.append(message)
+                    break
+
+        if not messages_to_delete:
+            return
+
+        # --- レートリミット回避 & 安全削除ロジック ---
+        # 14日以上前のメッセージは一括削除(bulk delete) APIが使えないため分ける
+        now = discord.utils.utcnow()
+        young_messages = []
+        old_messages = []
+
+        for msg in messages_to_delete:
+            if (now - msg.created_at).days < 14:
+                young_messages.append(msg)
+            else:
+                old_messages.append(msg)
+
+        # 1. 14日以内のメッセージ：100件単位で一括削除（1リクエストで済むためレートリミット0）
+        for i in range(0, len(young_messages), 100):
+            chunk = young_messages[i : i + 100]
+            try:
+                if len(chunk) == 1:
+                    await chunk[0].delete()
+                else:
+                    await log_channel.delete_messages(chunk)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+            await asyncio.sleep(1.0)  # 一括削除間も1秒待機してAPIを保護
+
+        # 2. 14日以上経過した古ログ：1件ずつ削除（1秒の間隔をあけてレートリミット回避）
+        for msg in old_messages:
+            try:
+                await msg.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+            await asyncio.sleep(1.2)  # レートリミット（429）を100%回避するためのウェイト
+
+    except (discord.Forbidden, discord.HTTPException, Exception):
+        # 予期せぬエラーでもBot全体がクラッシュしないようキャッチ
+        pass
 
 @bot.event
 async def on_app_command_completion(interaction: discord.Interaction, command):
@@ -6958,7 +7045,7 @@ async def antiphishing(interaction: discord.Interaction):
         executor_id=interaction.user.id
     )
 
-@bot.tree.command(name="embed_create", description="【サポート参加特典】カスタムEmbedを作成します")
+@bot.tree.command(name="embed_create", description="【サポートサーバー参加特典】カスタムEmbedを作成します")
 async def embed_create(interaction: discord.Interaction):
     # --- 1. サポートサーバー参加チェック ---
     support_guild = bot.get_guild(SUPPORT_GUILD_ID)
@@ -7074,19 +7161,19 @@ async def antiraid(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🛡️ Anti-Raid 設定",
         description=(
-            "サーバーへの一斉侵入や大規模荒らしを自動防衛します。\n\n"
-            "**防衛プロトコル：**\n"
+            "サーバーへの一斉参加や大規模荒らしを検知を設定します。\n\n"
+            "**検知ルール：**\n"
             "・**連続参加検知**: 10秒間に5人以上の参加で即座に招待リンクを無効化\n"
-            "・**緊急ロックダウン**: 異常検知時、全チャンネルの `@everyone` 送信権限を即座に剥奪\n"
-            "・**高速一括パージ**: 検知された攻撃アカウントを並列処理で最速BAN\n\n"
-            "⚠️ 有効化すると、検知時に管理ログへ赤色緊急通知が送信されます。"
+            "・**ロックダウン**: 異常検知時、全チャンネルの `@everyone` 送信権限を即座に剥奪\n"
+            "・**一括Ban**: 検知された攻撃アカウントを一括でBAN\n\n"
+            "⚠️ 有効化すると、検知時にセキュリティログへ通知が送信されます。"
         ),
         color=discord.Color.blue()
     )
     
     await interaction.followup.send(embed=embed, view=AntiRaidView(), ephemeral=True)
 
-@bot.tree.command(name="antinuke", description="サーバーの破壊行為（Nuke）を強力に防止します")
+@bot.tree.command(name="antinuke", description="サーバーへのNuke行為防止を設定します")
 async def antinuke(interaction: discord.Interaction):
     # --- 権限チェック ---
     if not interaction.user.guild_permissions.manage_guild:
@@ -7103,12 +7190,11 @@ async def antinuke(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🛡️ Anti-Nuke 設定",
         description=(
-            "サーバー管理権限の悪用や、Botによる大規模破壊を防止します。\n\n"
-            "**防衛プロトコル：**\n"
+            "サーバー管理権限の悪用や、BotによるNuke行為を防止します。\n\n"
+            "**検知ルール：**\n"
             "・**権限乱用検知**: チャンネルの一斉削除やロールの大量変更を即座に遮断\n"
-            "・**Bot招待者追放**: 許可なく導入された不正Botと、その**招待者を即座にBAN**\n"
-            "・**即時復元支援**: 削除された重要な設定やチャンネルを保護・ログ記録\n\n"
-            "⚠️ 有効化すると、異常検知時に攻撃者（管理者であっても）を即座に隔離します。"
+            "・**Bot招待者追放**: 許可なく導入された不正Botと、その**招待者を即座にBAN**\n\n"
+            "⚠️ 有効化すると、検知時に攻撃者を即座に隔離します。"
         ),
         color=discord.Color.red()  # Nuke対策は緊急性が高いため赤色
     )
@@ -7568,4 +7654,4 @@ logging.basicConfig(
 
 logger = logging.getLogger("SecuroWarden")
 
-bot.run("DISCORD_TOKEN_xxxxx")
+bot.run("BOT_TOKEN")
