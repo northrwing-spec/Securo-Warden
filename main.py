@@ -5,7 +5,7 @@ from discord import Webhook
 import asyncio
 import sqlite3
 import time
-import datetime 
+import datetime
 from datetime import timezone, timedelta, time as dt_time
 time_module = time 
 
@@ -1664,7 +1664,7 @@ def calculate_suspicious_score(member: discord.Member) -> int:
     アカウントの不審度を判定し、スコアを返す (誤検知防止・低速レイド対策用)
     """
     score = 0
-    now = datetime.now(timezone.utc)
+    now = datetime.datetime.now(timezone.utc)
     
     # 1. アカウント作成日による判定 (直近の捨て垢を警戒)
     account_age_days = (now - member.created_at).days
@@ -2807,6 +2807,13 @@ async def on_ready():
 
     # --- C. 重いWebhook同期をバックグラウンドで実行 (awaitしない) ---
     asyncio.create_task(sync_webhook_icons())
+
+# --- 追加: セッション復帰（Resumed）時や接続時にもステータスを確実に再適用・再起動する ---
+@bot.event
+async def on_resumed():
+    if not hasattr(bot, "presence_task") or bot.presence_task.done():
+        bot.presence_task = asyncio.create_task(presence_rotator())
+        print("Presence rotator restarted after resume")
 
 async def sync_webhook_icons():
     """Webhookアイコンの更新。重い処理なのでバックグラウンドで実行"""
@@ -7654,4 +7661,4 @@ logging.basicConfig(
 
 logger = logging.getLogger("SecuroWarden")
 
-bot.run("BOT_TOKEN")
+bot.run("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
