@@ -295,17 +295,6 @@ CREATE TABLE IF NOT EXISTS perm_guard (
 conn.commit()
 
 # ===============================
-# Alert Mode（警戒モード）
-# ===============================
-cur.execute("""
-CREATE TABLE IF NOT EXISTS alert_mode (
-    guild_id INTEGER PRIMARY KEY,
-    level TEXT NOT NULL CHECK(level IN ('low','medium','high'))
-)
-""")
-conn.commit()
-
-# ===============================
 # Admin penalty（利用停止）
 # ===============================
 cur.execute("""
@@ -533,11 +522,6 @@ def parse_duration(duration: str):
     return None
 
 def is_whitelisted_member(member: discord.Member) -> bool:
-    # HIGH 警戒時はホワイトリスト無視
-    alert = get_alert_mode(member.guild)
-    if alert == "high":
-        return False
-
     # ユーザー whitelist
     cur.execute(
         "SELECT 1 FROM whitelist_users WHERE guild_id=? AND user_id=?",
@@ -568,51 +552,6 @@ def is_dangerous_role(role: discord.Role) -> bool:
         perms.kick_members
     ])
 
-def get_alert_mode(guild: discord.Guild) -> str:
-    if guild is None:
-        return "medium"
-
-    try:
-        cur.execute(
-            "SELECT level FROM alert_mode WHERE guild_id=?",
-            (guild.id,)
-        )
-        row = cur.fetchone()
-        if row and row[0] in ("low", "medium", "high"):
-            return row[0]
-    except:
-        pass
-
-    return "medium"
-
-def build_alert_mode_embed(current: str) -> discord.Embed:
-    emoji = {
-        "low": "🟢",
-        "medium": "🟡",
-        "high": "🔴"
-    }
-
-    embed = discord.Embed(
-        title="🚨 警戒モード設定",
-        description=(
-            "**現在の警戒モード:** "
-            f"{emoji[current]} **{current.upper()}**\n\n"
-            "### 🟢 LOW（低）\n"
-            "・誤検知を最小限に\n"
-            "・通常運用向け\n\n"
-            "### 🟡 MEDIUM（中）\n"
-            "・標準設定（推奨）\n"
-            "・荒らし検知と安定性のバランス\n\n"
-            "### 🔴 HIGH（高）\n"
-            "・**ホワイトリスト無視**\n"
-            "・即BAN / 即AntiNuke\n"
-            "・荒らし発生中向け\n\n"
-            "⚠️ HIGHは一時的な使用を推奨"
-        ),
-        color=discord.Color.red()
-    )
-
-    return embed
 
 def log_user_action(
     *,
@@ -938,6 +877,40 @@ def is_advanced_scam_detection(text: str) -> tuple[bool, str]:
         return True, "不審な外部誘導・詐欺の疑い(スコア検知)"
     
     return False, ""
+
+def get_security_status(guild_id: int) -> dict:
+    # 1. Anti-Nuke (antinuke_bot)
+    cur.execute("SELECT enabled FROM antinuke_bot WHERE guild_id=?", (guild_id,))
+    row = cur.fetchone()
+    antinuke = row[0] == 1 if row else False
+
+    # 2. Anti-Spam (antispam_state)
+    cur.execute("SELECT enabled FROM antispam_state WHERE guild_id=?", (guild_id,))
+    row = cur.fetchone()
+    antispam = row[0] == 1 if row else False
+
+    # 3. Anti-Raid (antiraid_settings)
+    cur.execute("SELECT enabled FROM antiraid_settings WHERE guild_id=?", (guild_id,))
+    row = cur.fetchone()
+    antiraid = row[0] == 1 if row else False
+
+    # 4. Anti-Phishing (antiphishing_state)
+    cur.execute("SELECT enabled FROM antiphishing_state WHERE guild_id=?", (guild_id,))
+    row = cur.fetchone()
+    antiphishing = row[0] == 1 if row else False
+
+    # 5. PermGuard (perm_guard)
+    cur.execute("SELECT enabled FROM perm_guard WHERE guild_id=?", (guild_id,))
+    row = cur.fetchone()
+    perm_guard = row[0] == 1 if row else False
+
+    return {
+        "antinuke": antinuke,
+        "antispam": antispam,
+        "antiraid": antiraid,
+        "antiphishing": antiphishing,
+        "perm_guard": perm_guard
+    }
 
 # ===============================
 # Tasks
@@ -1999,39 +1972,6 @@ class PermGuardView(discord.ui.View):
             ephemeral=True
         )
 
-class AlertModeView(discord.ui.View):
-    def __init__(self, guild_id: int):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-
-    async def set_mode(
-        self,
-        interaction: discord.Interaction,
-        level: str
-    ):
-        cur.execute(
-            "INSERT OR REPLACE INTO alert_mode VALUES (?, ?)",
-            (self.guild_id, level)
-        )
-        conn.commit()
-
-        await interaction.response.send_message(
-            f"✅ 警戒モードを **{level.upper()}** に設定しました。",
-            ephemeral=True
-        )
-
-    @discord.ui.button(label="🟢 低", style=discord.ButtonStyle.success)
-    async def low(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.set_mode(interaction, "low")
-
-    @discord.ui.button(label="🟡 中", style=discord.ButtonStyle.secondary)
-    async def medium(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.set_mode(interaction, "medium")
-
-    @discord.ui.button(label="🔴 高", style=discord.ButtonStyle.danger)
-    async def high(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.set_mode(interaction, "high")
-
 # ===============================
 # 通報用 Modal
 # ===============================
@@ -2770,6 +2710,143 @@ class AntiRaidView(discord.ui.View):
         conn.commit()
         await interaction.response.send_message("✅ Anti-Raid機能を**無効**にしました。", ephemeral=True)
 
+class SetupMainView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+
+    def create_embed(self) -> discord.Embed:
+        st = get_security_status(self.guild_id)
+        
+        embed = discord.Embed(
+            title="🛡️Securo Warden セットアップ",
+            description=(
+                "以下のセキュリティ機能を一括または個別で設定できます。\n\n"
+                f"・Anti-Nuke: {'🟢有効' if st['antinuke'] else '🔴無効'}\n"
+                f"・Anti-Spam: {'🟢有効' if st['antispam'] else '🔴無効'}\n"
+                f"・Anti-Raid: {'🟢有効' if st['antiraid'] else '🔴無効'}\n"
+                f"・Anti-Phishing: {'🟢有効' if st['antiphishing'] else '🔴無効'}\n"
+                f"・Perm-Guard: {'🟢有効' if st['perm_guard'] else '🔴無効'}"
+            ),
+            color=discord.Color.blue()
+        )
+        return embed
+
+    @discord.ui.button(label="全て有効化(推奨)", style=discord.ButtonStyle.green, emoji="🚀")
+    async def enable_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gid = interaction.guild_id
+        
+        # すべてのテーブルの enabled を 1 に更新 (INSERT OR REPLACE または UPSERT)
+        cur.execute("INSERT OR REPLACE INTO antinuke_bot (guild_id, enabled) VALUES (?, 1)", (gid,))
+        cur.execute("INSERT OR REPLACE INTO antispam_state (guild_id, enabled) VALUES (?, 1)", (gid,))
+        cur.execute("INSERT OR REPLACE INTO antiraid_settings (guild_id, enabled) VALUES (?, 1)", (gid,))
+        cur.execute("INSERT OR REPLACE INTO antiphishing_state (guild_id, enabled) VALUES (?, 1)", (gid,))
+        cur.execute("INSERT OR REPLACE INTO perm_guard (guild_id, enabled) VALUES (?, 1)", (gid,))
+        conn.commit()
+
+        # 新しいメッセージ (ephemeral=True) で完了通知
+        await interaction.response.send_message("✅設定を全て有効化しました。", ephemeral=True)
+        
+        # 画面を更新して状態を反映
+        await interaction.message.edit(embed=self.create_embed(), view=self)
+
+    @discord.ui.button(label="個別に設定を変更", style=discord.ButtonStyle.secondary, emoji="⚙️")
+    async def customize(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 個別設定画面へ切り替え
+        view = SetupCustomizeView(self.guild_id)
+        await interaction.response.edit_message(embed=view.create_embed(), view=view)
+
+
+# ==========================================
+# 個別設定用 View
+# ==========================================
+class SetupCustomizeView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.update_button_labels()
+
+    def update_button_labels(self):
+        st = get_security_status(self.guild_id)
+        
+        # 各ボタンのラベルとスタイルを現在の状態に合わせて動的に変更
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                if item.custom_id == "toggle_antinuke":
+                    item.label = f"Anti-Nuke: {'ON' if st['antinuke'] else 'OFF'}"
+                    item.style = discord.ButtonStyle.green if st['antinuke'] else discord.ButtonStyle.red
+                elif item.custom_id == "toggle_antispam":
+                    item.label = f"Anti-Spam: {'ON' if st['antispam'] else 'OFF'}"
+                    item.style = discord.ButtonStyle.green if st['antispam'] else discord.ButtonStyle.red
+                elif item.custom_id == "toggle_antiraid":
+                    item.label = f"Anti-Raid: {'ON' if st['antiraid'] else 'OFF'}"
+                    item.style = discord.ButtonStyle.green if st['antiraid'] else discord.ButtonStyle.red
+                elif item.custom_id == "toggle_antiphishing":
+                    item.label = f"Anti-Phishing: {'ON' if st['antiphishing'] else 'OFF'}"
+                    item.style = discord.ButtonStyle.green if st['antiphishing'] else discord.ButtonStyle.red
+                elif item.custom_id == "toggle_permguard":
+                    item.label = f"PermGuard: {'ON' if st['perm_guard'] else 'OFF'}"
+                    item.style = discord.ButtonStyle.green if st['perm_guard'] else discord.ButtonStyle.red
+
+    def create_embed(self) -> discord.Embed:
+        st = get_security_status(self.guild_id)
+        
+        embed = discord.Embed(
+            title="⚙️ セキュリティ機能の個別設定",
+            description=(
+                "変更したい機能のボタンを押すと、ON/OFFが切り替わります。\n\n"
+                f"・ Anti-Nuke: {'🟢有効' if st['antinuke'] else '🔴無効'}\n"
+                f"・ Anti-Spam: {'🟢有効' if st['antispam'] else '🔴無効'}\n"
+                f"・ Anti-Raid: {'🟢有効' if st['antiraid'] else '🔴無効'}\n"
+                f"・ Anti-Phishing: {'🟢有効' if st['antiphishing'] else '🔴無効'}\n"
+                f"・ PermGuard: {'🟢有効' if st['perm_guard'] else '🔴無効'}"
+            ),
+            color=discord.Color.dark_blue()
+        )
+        return embed
+
+    async def toggle_feature(self, interaction: discord.Interaction, table: str, col: str):
+        gid = interaction.guild_id
+        # 現在の状態を取得
+        cur.execute(f"SELECT {col} FROM {table} WHERE guild_id=?", (gid,))
+        row = cur.fetchone()
+        
+        current_val = row[0] if row else 0
+        new_val = 0 if current_val == 1 else 1
+        
+        # 値を反転して保存
+        cur.execute(f"INSERT OR REPLACE INTO {table} (guild_id, {col}) VALUES (?, ?)", (gid, new_val))
+        conn.commit()
+
+        # ボタンと埋め込みを更新
+        self.update_button_labels()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    @discord.ui.button(label="Anti-Nuke: OFF", style=discord.ButtonStyle.red, emoji="🛡️", custom_id="toggle_antinuke", row=0)
+    async def btn_antinuke(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_feature(interaction, "antinuke_bot", "enabled")
+
+    @discord.ui.button(label="Anti-Spam: OFF", style=discord.ButtonStyle.red, emoji="💬", custom_id="toggle_antispam", row=0)
+    async def btn_antispam(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_feature(interaction, "antispam_state", "enabled")
+
+    @discord.ui.button(label="Anti-Raid: OFF", style=discord.ButtonStyle.red, emoji="🚨", custom_id="toggle_antiraid", row=0)
+    async def btn_antiraid(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_feature(interaction, "antiraid_settings", "enabled")
+
+    @discord.ui.button(label="Anti-Phishing: OFF", style=discord.ButtonStyle.red, emoji="🌚", custom_id="toggle_antiphishing", row=1)
+    async def btn_antiphishing(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_feature(interaction, "antiphishing_state", "enabled")
+
+    @discord.ui.button(label="PermGuard: OFF", style=discord.ButtonStyle.red, emoji="🔑", custom_id="toggle_permguard", row=1)
+    async def btn_permguard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.toggle_feature(interaction, "perm_guard", "enabled")
+
+    @discord.ui.button(label="メインメニューに戻る", style=discord.ButtonStyle.grey, emoji="↩️", custom_id="back_to_main", row=2)
+    async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        main_view = SetupMainView(self.guild_id)
+        await interaction.response.edit_message(embed=main_view.create_embed(), view=main_view)
+
 # ===============================
 # 起動イベント
 # ===============================
@@ -2800,7 +2877,6 @@ async def on_ready():
             bot.add_view(AntiNukeView(guild.id))
             bot.add_view(AntiSpamView(guild.id))
             bot.add_view(PermGuardView(guild.id))
-            bot.add_view(AlertModeView(guild.id))
             bot.add_view(InviteSafeModeView(guild.id))
     except Exception as e:
         print("Guild View registration error:", e)
@@ -3801,14 +3877,9 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
         return
 
     # ===============================
-    # Alert Mode（変更なし）
+    # 閾値設定（固定化: 5秒以内に2件）
     # ===============================
-    alert = get_alert_mode(guild)
-    threshold, window = (
-        (1, 5) if alert == "high"
-        else (2, 5) if alert == "medium"
-        else (3, 10)
-    )
+    threshold, window = (2, 5)
 
     # ===============================
     # カウント
@@ -3865,7 +3936,6 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
             [
                 ("対象ユーザー", f"{member} ({member.id})", False),
                 ("削除回数", f"{count} / {window}秒", False),
-                ("警戒モード", alert.upper(), False),
             ],
             discord.Color.dark_red()
         )
@@ -5826,49 +5896,6 @@ async def perm_guard(
 
 
 @bot.tree.command(
-    name="alert_mode",
-    description="サーバーの警戒モードを設定します"
-)
-async def alert_mode(interaction: discord.Interaction):
-    # 権限チェック (統一形式)
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message(
-            "❌ このコマンドを実行するには**サーバー管理**権限が必要です。",
-            ephemeral=True
-        )
-        return
-
-    # defer を実行
-    await interaction.response.defer(ephemeral=True)
-
-    guild = interaction.guild
-    if guild is None:
-        await interaction.followup.send(
-            "❌ サーバー内のみで使用できます。",
-            ephemeral=True
-        )
-        return
-
-    current = get_alert_mode(guild)
-
-    embed = build_alert_mode_embed(current)
-
-    await interaction.followup.send(
-        embed=embed,
-        view=AlertModeView(guild.id),
-        ephemeral=True
-    )
-
-    log_user_action(
-        action="alert_mode_open",
-        guild_id=guild.id,
-        executor_id=interaction.user.id,
-        extra={
-            "current_mode": current
-        }
-    )
-
-@bot.tree.command(
     name="report",
     description="BOTの利用規約違反者を通報します"
 )
@@ -7244,11 +7271,6 @@ async def security_status(interaction: discord.Interaction):
         row_perm = cur.fetchone()
         perm_guard = "ON" if row_perm and row_perm[0] == 1 else "OFF"
 
-        # 警戒モード (alert_mode)
-        cur.execute("SELECT level FROM alert_mode WHERE guild_id=?", (guild_id,))
-        row_alert = cur.fetchone()
-        alert_mode = row_alert[0].capitalize() if row_alert else "Low"
-
         # 大量招待作成防止 (invite_safemode)
         cur.execute("SELECT enabled FROM invite_safemode WHERE guild_id=?", (guild_id,))
         row_invite = cur.fetchone()
@@ -7275,7 +7297,6 @@ async def security_status(interaction: discord.Interaction):
             f"**Antinuke:** {antinuke}\n"
             f"**Antispam:** {antispam}\n"
             f"**権限荒らし防止:** {perm_guard}\n"
-            f"**警戒モード:** {alert_mode}\n"
             f"**大量招待作成防止:** {invite_safe}\n"
             f"**詐欺対策:** {antiphishing}\n"
             f"**AntiRaid:** {antiraid}"
@@ -7620,6 +7641,15 @@ async def honeypot_remove(interaction: discord.Interaction, channel: discord.Tex
 # コマンドグループをツリーに登録
 bot.tree.add_command(honeypot_group)
 
+@bot.tree.command(name="start_setup", description="セキュリティ機能のセットアップパネルを表示します")
+async def start_setup(interaction: discord.Interaction):
+    # 権限チェック（サーバー管理権限が必要な場合）
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("❌このコマンドを実行するには**サーバー管理**権限が必要です。", ephemeral=True)
+        return
+
+    view = SetupMainView(interaction.guild_id)
+    await interaction.response.send_message(embed=view.create_embed(), view=view, ephemeral=True)
 # ===============================
 # テキストコマンドでないコマンド類
 # ===============================
@@ -7660,5 +7690,4 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("SecuroWarden")
-
 bot.run("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
